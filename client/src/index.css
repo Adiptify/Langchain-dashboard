@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    font-family: 'Outfit', 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+    font-weight: 400;
+
+    color-scheme: dark;
+    color: rgba(255, 255, 255, 0.95);
+    background-color: #020617;
+
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    display: flex;
+    min-width: 320px;
+    min-height: 100vh;
+    background: radial-gradient(circle at top right, #1e293b, #020617);
+    overflow: hidden;
+  }
+}
+
+#root {
+  width: 100%;
+}
+
+.glass-card {
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+}
+
+.glass-card:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+  background: rgba(15, 23, 42, 0.8);
+}
+
+::-webkit-scrollbar {
+  width: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.pulse {
+  animation: pulse-animation 2s infinite;
+}
+
+@keyframes pulse-animation {
+  0% {
+    box-shadow: 0 0 0 0px rgba(79, 209, 197, 0.4);
+  }
+
+  70% {
+    box-shadow: 0 0 0 20px rgba(79, 209, 197, 0);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0px rgba(79, 209, 197, 0);
+  }
+}
+
+.wave-bar {
+  display: inline-block;
+  width: 2px;
+  height: 10px;
+  background: #4fd1c5;
+  border-radius: 10px;
+  margin: 0 1px;
+  animation: wave 1.2s linear infinite;
+}
+
+@keyframes wave {
+
+  0%,
+  100% {
+    transform: scaleY(0.5);
+  }
+
+  50% {
+    transform: scaleY(1.5);
+  }
+}
+
+.glow-text {
+  text-shadow: 0 0 8px rgba(79, 209, 197, 0.3);
+}
+
+/* Transitions */
+.transition-all {
+  transition-duration: 300ms;
+}
+
+button {
+  cursor: pointer;
+}
