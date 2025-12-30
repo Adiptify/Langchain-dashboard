@@ -10,6 +10,27 @@ import requests
 import time
 import warnings
 
+def _extract_date_from_filename(filename: str) -> Optional[str]:
+    """Tries to find a YYYY-MM-DD or DD-MM-YYYY pattern in filename."""
+    patterns = [
+        r'(\d{4}-\d{2}-\d{2})',
+        r'(\d{2}-\d{2}-\d{4})'
+    ]
+    for p in patterns:
+        match = re.search(p, filename)
+        if match:
+            date_str = match.group(1)
+            # Normalize to ISO
+            try:
+                if '-' in date_str:
+                    parts = date_str.split('-')
+                    if len(parts[0]) == 4: # YYYY-MM-DD
+                        return date_str
+                    else: # DD-MM-YYYY
+                        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+            except: pass
+    return None
+
 # Additional imports for file processing
 try:
     import PyPDF2
@@ -395,8 +416,38 @@ def _detect_column_type(series: pd.Series):
         logger.debug(f"Error during date detection for column: {e}")
         pass
 
-    # Default to string
+# Default to string
     return "string"
+
+def _detect_unit(header: str) -> str:
+    """
+    Detects the unit of measurement from a header string.
+    Returns the unit (e.g., 'KWH', 'm3', 'units') or 'units' as default.
+    """
+    header_upper = header.upper()
+    
+    # Common industrial units
+    unit_map = {
+        'KWH': ['KWH', 'ENERGY', 'ELECTRICITY', 'POWER'],
+        'M3': ['M3', 'WATER', 'FLOW', 'VOLUME', 'CUBIC'],
+        'KG': ['KG', 'WEIGHT', 'MASS', 'KILOGRAM'],
+        'MT': ['MT', 'TON', 'TONNE'],
+        'PSI': ['PSI', 'PRESSURE', 'BAR'],
+        'LTR': ['LTR', 'LITRE', 'LITER', 'FUEL', 'OIL'],
+        'UNITS': ['UNITS', 'NOS', 'QTY', 'QUANTITY', 'COUNT', 'PRODUCED'],
+        'TEMP': ['TEMP', 'CELSIUS', 'FAHRENHEIT', 'DEGREE'],
+    }
+    
+    for unit, keywords in unit_map.items():
+        if any(k in header_upper for k in keywords):
+            return unit
+            
+    # Check if unit is explicitly in parentheses/after slash
+    match = re.search(r'[\(\/]\s*([a-zA-Z0-9]{1,5})\s*[\)]', header)
+    if match:
+        return match.group(1).upper()
+        
+    return "units" # Generic fallback
 
 def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_name: str = None) -> List[Document]:
     """
@@ -406,11 +457,21 @@ def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_nam
     normalized_columns = {}
     column_types = {}
 
-    # Normalize headers and detect types
+    # Normalize headers and detect types/units
     for col in df.columns:
         normalized_col = _normalize_header(str(col))
         normalized_columns[col] = normalized_col
         column_types[normalized_col] = _detect_column_type(df[col])
+    
+    # Try to find a global unit for the sheet/file if columns are mostly one type
+    detected_units = [_detect_unit(str(col)) for col in df.columns]
+    # Filter out generic 'units' to find specialized one
+    specialized_units = [u for u in detected_units if u != 'UNITS']
+    global_unit = specialized_units[0] if specialized_units else "units"
+    
+    # Semantic Extract for the whole sheet if it's not too huge
+    sheet_sample = df.head(5).to_string()
+    context_tags = _extract_semantic_tags(sheet_sample)
     
     df.rename(columns=normalized_columns, inplace=True)
 
@@ -462,10 +523,10 @@ def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_nam
             formatted_date = current_date_col.replace('_', ' ').replace('000000', '').strip()
             
             if not pd.isna(date_val):
-                row_summary_parts.append(f"on Date {formatted_date} {str(date_val).strip()} KWH")
+                row_summary_parts.append(f"on Date {formatted_date} value is {str(date_val).strip()} {global_unit}")
             
             if diff_col and not pd.isna(diff_val):
-                row_summary_parts.append(f"both day difference {str(diff_val).strip()} KWH")
+                row_summary_parts.append(f"differential value {str(diff_val).strip()} {global_unit}")
 
         # PERFORMANCE OPTIMIZATION: Bypass SLM summary for large datasets
         # Only use SLM for high-importance summary documents or if explicitly requested.
@@ -478,14 +539,17 @@ def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_nam
             # High-performance template-based summary
             row_summary_content = " ".join(row_summary_parts) if row_summary_parts else f"Entry: {str(row.to_dict())[:200]}"
 
+        doc_date = _extract_date_from_filename(file_name) or datetime.now().strftime("%Y-%m-%d")
         metadata = {
             "file_id": file_id,
             "file_name": file_name,
             "sheet": sheet_name,
             "row_id": row_id,
             "columns": list(df.columns),
-            "numeric_fields": numeric_fields, # Still collect numeric fields for potential filtering
-            "created_at": datetime.now().isoformat(),
+            "numeric_fields": numeric_fields,
+            "context_tags": context_tags,
+            "created_at": doc_date,
+            "data_date_start": doc_date,
             "trusted": TRUSTED_FLAG_DEFAULT,
             "doc_type": "row",
         }
@@ -541,6 +605,7 @@ def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_nam
             "sheet": sheet_name,
             "column_name": col_name,
             "column_type": col_type,
+            "context_tags": context_tags,
             "created_at": datetime.now().isoformat(),
             "trusted": TRUSTED_FLAG_DEFAULT,
             "doc_type": "column_summary",
@@ -549,27 +614,167 @@ def _process_dataframe(df: pd.DataFrame, file_id: str, file_name: str, sheet_nam
 
     return documents
 
-def _chunk_text(text: str, file_id: str, file_name: str, page_no: int = None, section_title: str = None) -> List[Document]:
+def _generate_file_summary(text: str, file_name: str) -> str:
+    """Generates a high-level summary of a file's content using SLM."""
+    sample_text = text[:4000] if len(text) > 4000 else text
+    
+    prompt = f"""Summarize the following document content concisely in 2-3 sentences.
+Focus on the main topic, purpose, and key entities mentioned.
+Document Name: {file_name}
+Content: {sample_text}
+Summary:"""
+
+    logger.info(f"Generating SLM summary for file: {file_name}")
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": SLM_PARSE_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.3}
+            },
+            timeout=45
+        )
+        response.raise_for_status()
+        summary = response.json().get("response", "").strip()
+        return summary if summary else "No summary generated."
+    except Exception as e:
+        logger.error(f"Error generating file summary: {e}")
+        return f"Summary of {file_name} content."
+
+def _extract_semantic_tags(text: str) -> List[str]:
+    """Extracts key entities (locations, machines, metrics) from text for semantic correlation."""
+    sample_text = text[:3000] if len(text) > 3000 else text
+    
+    prompt = f"""Identify the most important industrial entities from this text.
+Return ONLY a comma-separated list of keywords.
+
+Focus on: 
+1. Specific machine/location codes (e.g., L21, I/C-1, Panel A)
+2. Equipment names (e.g., Boiler, Pump, Turbine)
+3. Department names.
+
+Text: {sample_text}
+Entities:"""
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": SLM_PARSE_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1}
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        tags_raw = response.json().get("response", "").strip()
+        tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+        return list(set(tags))[:10] # Return top 10 unique tags
+    except Exception as e:
+        logger.error(f"Error extracting semantic tags: {e}")
+        return []
+
+def _chunk_text(text: str, file_id: str, file_name: str, page_no: int = None, section_title: str = None, context_tags: List[str] = None) -> List[Document]:
     """
-    Chunks text into smaller documents with overlap.
+    Chunks text into smaller documents with overlap more intelligently.
     """
-    # Basic word-based chunking for now
-    words = text.split()
+    if not text:
+        return []
+
+    # Clean text: normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
     chunks = []
-    for i in range(0, len(words), TEXT_CHUNK_SIZE - TEXT_CHUNK_OVERLAP):
-        chunk_words = words[i:i + TEXT_CHUNK_SIZE]
-        content = " ".join(chunk_words)
-        metadata = {
-            "file_id": file_id,
-            "file_name": file_name,
-            "page_no": page_no,
-            "section_title": section_title,
-            "chunk_id": str(uuid.uuid4()),
-            "created_at": datetime.now().isoformat(),
-            "trusted": TRUSTED_FLAG_DEFAULT,
-            "doc_type": "text_chunk",
-        }
-        chunks.append(Document(doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name, doc_type="text_chunk", content=content, metadata=metadata))
+    start = 0
+    text_len = len(text)
+    
+    while start < text_len:
+        # Determine end of chunk
+        end = start + TEXT_CHUNK_SIZE
+        
+        # If not the end of text, try to find a natural break (period, newline)
+        if end < text_len:
+            # Look for a period or newline in the last 100 chars of the intended chunk
+            search_window = text[max(start, end-100):end]
+            last_period = search_window.rfind('.')
+            last_newline = search_window.rfind('\n')
+            
+            break_point = max(last_period, last_newline)
+            if break_point != -1:
+                end = max(start, end - 100) + break_point + 1
+        
+        chunk_content = text[start:end].strip()
+        if chunk_content:
+            metadata = {
+                "file_id": file_id,
+                "file_name": file_name,
+                "page_no": page_no,
+                "section_title": section_title,
+                "chunk_id": str(uuid.uuid4()),
+                "context_tags": context_tags or [],
+                "created_at": datetime.now().isoformat(),
+                "trusted": TRUSTED_FLAG_DEFAULT,
+                "doc_type": "text_chunk",
+            }
+            chunks.append(Document(doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name, doc_type="text_chunk", content=chunk_content, metadata=metadata))
+        
+        # Move start forward by (chunk_size - overlap)
+        start = end - TEXT_CHUNK_OVERLAP
+        if start >= text_len or end >= text_len:
+            break
+
+    return chunks
+    """
+    Chunks text into smaller documents with overlap more intelligently.
+    """
+    if not text:
+        return []
+
+    # Clean text: normalize whitespace
+    text = re.sub(r'\\s+', ' ', text).strip()
+    
+    chunks = []
+    start = 0
+    text_len = len(text)
+    
+    while start < text_len:
+        # Determine end of chunk
+        end = start + TEXT_CHUNK_SIZE
+        
+        # If not the end of text, try to find a natural break (period, newline)
+        if end < text_len:
+            # Look for a period or newline in the last 100 chars of the intended chunk
+            search_window = text[max(start, end-100):end]
+            last_period = search_window.rfind('.')
+            last_newline = search_window.rfind('\n')
+            
+            break_point = max(last_period, last_newline)
+            if break_point != -1:
+                end = max(start, end - 100) + break_point + 1
+        
+        chunk_content = text[start:end].strip()
+        if chunk_content:
+            metadata = {
+                "file_id": file_id,
+                "file_name": file_name,
+                "page_no": page_no,
+                "section_title": section_title,
+                "chunk_id": str(uuid.uuid4()),
+                "context_tags": context_tags or [],
+                "created_at": datetime.now().isoformat(),
+                "trusted": TRUSTED_FLAG_DEFAULT,
+                "doc_type": "text_chunk",
+            }
+            chunks.append(Document(doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name, doc_type="text_chunk", content=chunk_content, metadata=metadata))
+        
+        # Move start forward by (chunk_size - overlap)
+        start = end - TEXT_CHUNK_OVERLAP
+        if start >= text_len or end >= text_len:
+            break
+
     return chunks
 
 def _process_pdf_file(file_path: str, file_id: str, file_name: str) -> List[Document]:
@@ -579,38 +784,46 @@ def _process_pdf_file(file_path: str, file_id: str, file_name: str) -> List[Docu
         return []
     
     documents = []
+    full_text = []
     try:
         with open(file_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
             
             for page_num, page in enumerate(pdf_reader.pages):
                 text = page.extract_text()
-                if text.strip():
-                    # Create metadata for each page
-                    metadata = {
-                        "page_number": page_num + 1,
-                        "total_pages": len(pdf_reader.pages),
-                        "file_type": "pdf",
-                        "created_at": datetime.now().isoformat(),
-                        "trusted": TRUSTED_FLAG_DEFAULT,
-                        "doc_type": "text_chunk",
-                    }
-                    
-                    # Chunk the page text if it's too long
-                    if len(text) > TEXT_CHUNK_SIZE:
-                        chunks = _chunk_text(text, file_id, file_name)
-                        documents.extend(chunks)
-                    else:
-                        doc = Document(
-                            doc_id=str(uuid.uuid4()),
-                            file_id=file_id,
-                            file_name=file_name,
-                            doc_type="text_chunk",
-                            content=text,
-                            metadata=metadata
-                        )
-                        documents.append(doc)
+                if text and text.strip():
+                    full_text.append(text)
+                    # For very large PDFs, we still chunk by page
+                    page_docs = _chunk_text(text, file_id, file_name, page_no=page_num+1)
+                    documents.extend(page_docs)
         
+        # Add a global summary document for the whole PDF
+        if full_text:
+            combined_text = "\n".join(full_text)
+            summary = _generate_file_summary(combined_text, file_name)
+            context_tags = _extract_semantic_tags(combined_text)
+            
+            # Re-chunk with tags for better correlation
+            for i, doc in enumerate(documents):
+                doc.metadata["context_tags"] = context_tags
+
+            summary_doc = Document(
+                doc_id=str(uuid.uuid4()),
+                file_id=file_id,
+                file_name=file_name,
+                doc_type="plant_summary",
+                content=f"FILE OVERVIEW & CORRELATION ({file_name}): {summary}\nEntities: {', '.join(context_tags)}",
+                metadata={
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "doc_type": "file_summary",
+                    "context_tags": context_tags,
+                    "created_at": datetime.now().isoformat(),
+                    "trusted": TRUSTED_FLAG_DEFAULT
+                }
+            )
+            documents.append(summary_doc)
+            
         logger.info(f"Processed PDF file: {file_name} - {len(documents)} documents created")
         return documents
         
@@ -647,30 +860,31 @@ def _process_docx_file(file_path: str, file_id: str, file_name: str) -> List[Doc
         combined_text = "\n".join(full_text)
         
         if combined_text.strip():
-            # Create metadata
-            metadata = {
-                "file_type": "docx",
-                "paragraph_count": len(doc.paragraphs),
-                "table_count": len(doc.tables),
-                "created_at": datetime.now().isoformat(),
-                "trusted": TRUSTED_FLAG_DEFAULT,
-                "doc_type": "text_chunk",
-            }
+            # Extract tags for correlation
+            context_tags = _extract_semantic_tags(combined_text)
             
-            # Chunk the text if it's too long
-            if len(combined_text) > TEXT_CHUNK_SIZE:
-                chunks = _chunk_text(combined_text, file_id, file_name)
-                documents.extend(chunks)
-            else:
-                doc_obj = Document(
-                    doc_id=str(uuid.uuid4()),
-                    file_id=file_id,
-                    file_name=file_name,
-                    doc_type="text_chunk",
-                    content=combined_text,
-                    metadata=metadata
-                )
-                documents.append(doc_obj)
+            # Chunk the text with tags
+            chunks = _chunk_text(combined_text, file_id, file_name, context_tags=context_tags)
+            documents.extend(chunks)
+            
+            # Add summary
+            summary = _generate_file_summary(combined_text, file_name)
+            summary_doc = Document(
+                doc_id=str(uuid.uuid4()),
+                file_id=file_id,
+                file_name=file_name,
+                doc_type="plant_summary",
+                content=f"FILE OVERVIEW & CORRELATION ({file_name}): {summary}\nEntities: {', '.join(context_tags)}",
+                metadata={
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "doc_type": "file_summary",
+                    "context_tags": context_tags,
+                    "created_at": datetime.now().isoformat(),
+                    "trusted": TRUSTED_FLAG_DEFAULT
+                }
+            )
+            documents.append(summary_doc)
         
         logger.info(f"Processed DOCX file: {file_name} - {len(documents)} documents created")
         return documents
@@ -684,33 +898,59 @@ def _process_other_text_file(file_path: str, file_id: str, file_name: str) -> Li
     documents = []
     try:
         # Try different encodings
-        encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+        encodings = ['utf-8', 'utf-16', 'utf-16-le', 'latin-1', 'cp1252', 'iso-8859-1']
         text_content = None
         
         for encoding in encodings:
             try:
                 with open(file_path, 'r', encoding=encoding) as f:
                     text_content = f.read()
-                break
-            except UnicodeDecodeError:
+                # Simple check if decoding worked reasonably
+                if text_content and '\x00' not in text_content[:100]:
+                    break
+            except (UnicodeDecodeError, UnicodeError):
                 continue
         
         if text_content is None:
             logger.error(f"Could not decode file {file_name} with any supported encoding")
             return []
         
+        # Extract date from filename if possible
+        doc_date = _extract_date_from_filename(file_name) or datetime.now().strftime("%Y-%m-%d")
+
         # Create metadata
         metadata = {
             "file_type": file_path.split('.')[-1].lower(),
             "encoding": encoding,
-            "created_at": datetime.now().isoformat(),
+            "context_tags": context_tags,
+            "created_at": doc_date,
+            "data_date_start": doc_date,
             "trusted": TRUSTED_FLAG_DEFAULT,
             "doc_type": "text_chunk",
         }
         
         # Chunk the text
-        chunks = _chunk_text(text_content, file_id, file_name)
+        chunks = _chunk_text(text_content, file_id, file_name, context_tags=context_tags)
         documents.extend(chunks)
+        
+        # Add summary
+        summary = _generate_file_summary(text_content, file_name)
+        summary_doc = Document(
+            doc_id=str(uuid.uuid4()),
+            file_id=file_id,
+            file_name=file_name,
+            doc_type="plant_summary",
+            content=f"FILE OVERVIEW & CORRELATION ({file_name}): {summary}\nEntities: {', '.join(context_tags)}",
+            metadata={
+                "file_id": file_id,
+                "file_name": file_name,
+                "doc_type": "file_summary",
+                "context_tags": context_tags,
+                "created_at": datetime.now().isoformat(),
+                "trusted": TRUSTED_FLAG_DEFAULT
+            }
+        )
+        documents.append(summary_doc)
         
         logger.info(f"Processed text file: {file_name} - {len(documents)} documents created")
         return documents
@@ -786,7 +1026,7 @@ def ingest_file(file_path: str, file_id: str = None, row_limit: Optional[int] = 
     """
     file_name = os.path.basename(file_path)
     if file_id is None:
-        file_id = str(uuid.uuid4())
+        file_id = f"file_{int(time.time())}_{file_name}"
 
     logger.info(f"Starting ingestion for file: {file_path}")
     all_documents: List[Document] = []
@@ -795,7 +1035,21 @@ def ingest_file(file_path: str, file_id: str = None, row_limit: Optional[int] = 
         if file_path.endswith(('.csv', '.xlsx')):
             df = None
             if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
+                # Try different encodings for CSV
+                encodings = ['utf-8', 'utf-16', 'utf-16-le', 'cp1252', 'latin-1']
+                for enc in encodings:
+                    try:
+                        df = pd.read_csv(file_path, encoding=enc)
+                        # Check if it loaded correctly
+                        if not df.empty and df.columns[0].startswith('\xff\xfe'):
+                            continue # Still garbage
+                        break
+                    except (UnicodeDecodeError, Exception):
+                        continue
+                
+                if df is None:
+                    logger.error(f"Could not load CSV {file_name} with any supported encoding.")
+                    return []
             elif file_path.endswith('.xlsx'):
                 xl = pd.ExcelFile(file_path)
                 # Process ALL sheets
@@ -827,12 +1081,9 @@ def ingest_file(file_path: str, file_id: str = None, row_limit: Optional[int] = 
             log_process_completion(f"Ingestion of DOCX: {file_name}", details="Processed as DOCX document")
 
         elif file_path.endswith('.txt'):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text_content = f.read()
-            # Prepend context to text content
-            if file_context:
-                text_content = f"Context: {file_context}\n\n{text_content}"
-            all_documents.extend(_chunk_text(text_content, file_id, file_name))
+            # Use robust loading for TXT
+            documents = _process_other_text_file(file_path, file_id, file_name)
+            all_documents.extend(documents)
             log_process_completion(f"Ingestion of TXT: {file_name}", details="Processed as textual data")
 
         elif file_path.endswith(('.log', '.md', '.json', '.xml', '.yaml', '.yml')):

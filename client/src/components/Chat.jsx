@@ -212,8 +212,22 @@ const Chat = ({ messages, setMessages }) => {
             const assistantMessage = {
                 role: 'assistant',
                 content: response.data.answer,
-                results: response.data.results
+                results: response.data.results,
+                detected_date_range: response.data.detected_date_range
             };
+
+            // Add date filter tag to user message for UI feedback
+            if (response.data.detected_date_range) {
+                setMessages(prev => {
+                    const newMessages = [...prev];
+                    const lastUserIdx = newMessages.length - 1;
+                    if (lastUserIdx >= 0 && newMessages[lastUserIdx].role === 'user') {
+                        newMessages[lastUserIdx].detected_date_range = response.data.detected_date_range;
+                    }
+                    return newMessages;
+                });
+            }
+
             setMessages(prev => [...prev, assistantMessage]);
         } catch (error) {
             setMessages(prev => [...prev, {
@@ -298,6 +312,14 @@ const Chat = ({ messages, setMessages }) => {
                                         )}
                                     </div>
 
+                                    {message.detected_date_range && (
+                                        <div className="mt-2 flex items-center gap-1.5 opacity-60">
+                                            <div className="px-2 py-0.5 rounded-full bg-primary/20 border border-primary/30 text-[9px] font-bold text-primary-light uppercase tracking-tighter">
+                                                Temporal Filter: {message.detected_date_range.start_date} → {message.detected_date_range.end_date}
+                                            </div>
+                                        </div>
+                                    )}
+
                                     {message.role === 'assistant' && (
                                         <button
                                             onClick={() => handleSpeech(message.content, index)}
@@ -309,12 +331,27 @@ const Chat = ({ messages, setMessages }) => {
                                     )}
 
                                     {message.results && message.results.length > 0 && (
-                                        <div className="mt-4 pt-4 border-t border-white/5 space-y-2">
-                                            <p className="text-[10px] font-bold text-white/20 uppercase tracking-widest">Data Sources</p>
+                                        <div className="mt-4 pt-4 border-t border-white/5 space-y-3">
+                                            <div className="flex items-center justify-between">
+                                                <p className="text-[10px] font-bold text-white/20 uppercase tracking-widest">Correlated Insights</p>
+                                            </div>
                                             <div className="flex flex-wrap gap-2">
                                                 {message.results.map((res, i) => (
-                                                    <div key={i} className="px-2 py-1 rounded bg-white/5 border border-white/5 text-[10px] text-white/40">
-                                                        <span className="font-bold text-primary-light/60 uppercase">{res.doc_type?.replace('_', ' ')}</span>: {res.file_name}
+                                                    <div key={i} className="group/src relative">
+                                                        <div className="px-2 py-1.5 rounded-lg bg-white/5 border border-white/5 text-[10px] text-white/50 hover:bg-white/10 hover:text-white/80 transition-all cursor-default flex flex-col gap-1">
+                                                            <div className="flex items-center gap-2">
+                                                                <span className="font-bold text-primary-light/60 uppercase">{res.doc_type?.replace('_', ' ')}</span>
+                                                                <span className="w-1 h-1 rounded-full bg-white/20" />
+                                                                <span>{res.file_name}</span>
+                                                            </div>
+                                                            {res.metadata?.context_tags && res.metadata.context_tags.length > 0 && (
+                                                                <div className="flex flex-wrap gap-1 mt-1">
+                                                                    {res.metadata.context_tags.slice(0, 3).map((tag, tIdx) => (
+                                                                        <span key={tIdx} className="px-1.5 py-0.5 rounded bg-primary/10 text-[8px] text-primary-light/70 font-medium">#{tag}</span>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
                                                     </div>
                                                 ))}
                                             </div>

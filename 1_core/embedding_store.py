@@ -312,9 +312,16 @@ class EmbeddingStore:
         sorted_keywords = sorted(list(set(expanded_keywords)), key=get_priority, reverse=True)
         return sorted_keywords
 
-    def keyword_search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    def keyword_search(self, query: str, k: int = 5, date_filter: Optional[Dict[str, str]] = None, primary_entities: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Exact and fuzzy keyword lookup in the SQLite metadata."""
         keywords = self._extract_keywords(query)
+        if not keywords:
+            keywords = []
+            
+        # Combine extracted keywords with primary entities for comprehensive search
+        if primary_entities:
+            keywords = list(set(keywords + primary_entities))
+            
         if not keywords:
             return []
             
@@ -324,34 +331,55 @@ class EmbeddingStore:
         results = []
         seen_ids = set()
         
+        # Build date SQL if filter exists
+        date_sql = ""
+        date_params = []
+        if date_filter and date_filter.get('start_date') and date_filter.get('end_date'):
+            # This assumes metadata contains dates. For 'row' docs we check specific date fields
+            # For this simplified version, we search within the JSON metadata if specific date fields aren't indexed
+            # Refinement: We'll filter globally by the detected range where possible
+            date_sql = " AND (json_extract(metadata, '$.created_at') BETWEEN ? AND ?)"
+            date_params = [date_filter['start_date'], date_filter['end_date'] + "T23:59:59"]
+
         for kw in keywords:
             # 1. Exact/Fuzzy SQL Search
-            query_sql = "SELECT doc_id, file_id, file_name, doc_type, content, metadata FROM documents WHERE (content LIKE ? OR metadata LIKE ?) LIMIT ?"
-            cursor.execute(query_sql, (f'%{kw}%', f'%{kw}%', k))
+            query_sql = f"SELECT doc_id, file_id, file_name, doc_type, content, metadata FROM documents WHERE (content LIKE ? OR metadata LIKE ?){date_sql} LIMIT ?"
+            params = [f'%{kw}%', f'%{kw}%'] + date_params + [k]
+            cursor.execute(query_sql, params)
             rows = cursor.fetchall()
             
             # 2. Advanced Fuzzy Match (Typo Tolerance)
-            # If nothing found, try to find a similar feeder name
             if not rows and len(kw) > 3:
                 cursor.execute("SELECT DISTINCT json_extract(metadata, '$.feeder') as fname FROM documents WHERE doc_type = 'feeder_data'")
                 all_feeders = [r[0] for r in cursor.fetchall() if r[0]]
                 
                 matches = difflib.get_close_matches(kw, all_feeders, n=2, cutoff=0.7)
                 if matches:
-                    # Search again with the corrected name
-                    cursor.execute(query_sql, (f'%{matches[0]}%', f'%{matches[0]}%', k))
+                    cursor.execute(query_sql, [f'%{matches[0]}%', f'%{matches[0]}%'] + date_params + [k])
                     rows = cursor.fetchall()
 
             for row in rows:
                 if row[0] not in seen_ids:
+                    metadata = json.loads(row[5])
+                    
+                    # Boost score if primary entity is found
+                    score = 1.2
+                    if primary_entities:
+                        content_upper = row[4].upper()
+                        meta_str_upper = row[5].upper()
+                        for ent in primary_entities:
+                            if ent.upper() in content_upper or ent.upper() in meta_str_upper:
+                                score += 2.0 # Significant boost for technical codes (e.g., L21)
+                                break
+
                     results.append({
                         "doc_id": row[0],
                         "file_id": row[1],
                         "file_name": row[2],
                         "doc_type": row[3],
                         "content": row[4],
-                        "metadata": json.loads(row[5]),
-                        "score": 1.2, # Direct keyword matches get a high fixed score
+                        "metadata": metadata,
+                        "score": score,
                         "match_type": "keyword"
                     })
                     seen_ids.add(row[0])
@@ -359,7 +387,7 @@ class EmbeddingStore:
         conn.close()
         return results[:k]
 
-    def vector_search(self, query: str, k: int = 5, file_id_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    def vector_search(self, query: str, k: int = 5, file_id_filter: Optional[str] = None, date_filter: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         """Semantic similarity search using FAISS."""
         query_embedding = self._get_embedding(query)
         if query_embedding is None:
@@ -368,7 +396,9 @@ class EmbeddingStore:
         if not self.faiss_index or self.faiss_index.ntotal == 0:
             return []
 
-        D, I = self.faiss_index.search(np.array([query_embedding]).astype('float32'), k)
+        # Vector search doesn't support filters directly, so we retrieve more then filter
+        search_k = k * 3 if date_filter or file_id_filter else k
+        D, I = self.faiss_index.search(np.array([query_embedding]).astype('float32'), search_k)
 
         results = []
         conn = sqlite3.connect(METADATA_DB_PATH)
@@ -378,19 +408,25 @@ class EmbeddingStore:
             if doc_idx == -1:
                 continue
 
-            distance = float(D[0][i])
-            similarity_score = 1 / (1 + distance / 100)
-            
-            if similarity_score < 0.01:
-                continue
-
             doc_id = self.faiss_id_to_doc_id.get(str(doc_idx))
             if doc_id:
-                cursor.execute("SELECT file_id, file_name, doc_type, content, metadata FROM documents WHERE doc_id = ?", (doc_id,))
+                # Build filter SQL
+                sql = "SELECT file_id, file_name, doc_type, content, metadata FROM documents WHERE doc_id = ?"
+                params = [doc_id]
+                
+                if date_filter and date_filter.get('start_date') and date_filter.get('end_date'):
+                    sql += " AND (json_extract(metadata, '$.created_at') BETWEEN ? AND ?)"
+                    params.extend([date_filter['start_date'], date_filter['end_date'] + "T23:59:59"])
+                
+                cursor.execute(sql, params)
                 doc_data = cursor.fetchone()
+                
                 if doc_data:
                     retrieved_file_id, file_name, doc_type, content, metadata_str = doc_data
                     if file_id_filter is None or retrieved_file_id == file_id_filter:
+                        distance = float(D[0][i])
+                        similarity_score = 1 / (1 + distance / 100)
+                        
                         results.append({
                             "doc_id": doc_id,
                             "file_id": retrieved_file_id,
@@ -402,16 +438,19 @@ class EmbeddingStore:
                             "score": similarity_score,
                             "match_type": "vector"
                         })
+            if len(results) >= k:
+                break
+                
         conn.close()
         return results
 
-    def search(self, query: str, k: int = 5, file_id_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 5, file_id_filter: Optional[str] = None, date_filter: Optional[Dict[str, str]] = None, primary_entities: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Hybrid Search: Combines keyword precision with vector intelligence."""
         # 1. Keyword search (Precision)
-        kw_results = self.keyword_search(query, k=k)
+        kw_results = self.keyword_search(query, k=k, date_filter=date_filter, primary_entities=primary_entities)
         
         # 2. Vector search (Intelligence)
-        vec_results = self.vector_search(query, k=k, file_id_filter=file_id_filter)
+        vec_results = self.vector_search(query, k=k, file_id_filter=file_id_filter, date_filter=date_filter)
         
         # 3. Merge and deduplicate
         combined = kw_results.copy()
@@ -419,10 +458,19 @@ class EmbeddingStore:
         
         for doc in vec_results:
             if doc['doc_id'] not in seen_ids:
+                # Still check if vector results contain primary entities for post-retrieval boost
+                if primary_entities:
+                    content_upper = doc['content'].upper()
+                    meta_upper = str(doc['metadata']).upper()
+                    for ent in primary_entities:
+                        if ent.upper() in content_upper or ent.upper() in meta_upper:
+                            doc['score'] += 0.5 # Smaller boost for semantic matches
+                            break
+                            
                 combined.append(doc)
                 seen_ids.add(doc['doc_id'])
         
-        # Sort by score (Keyword matches (1.2) rank higher than typical vector matches)
+        # Sort by score 
         combined.sort(key=lambda x: x['score'], reverse=True)
         return combined[:k]
 

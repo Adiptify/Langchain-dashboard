@@ -130,7 +130,7 @@ class JSWEnergyPreprocessor:
 
         # 2. Handle Numeric Days (1-31) with Sheet Context
         if s.isdigit() and 1 <= int(s) <= 31:
-            if sheet_context and sheet_context["month"] and sheet_context["year"]:
+            if sheet_context and sheet_context.get("month") and sheet_context.get("year"):
                 try:
                     day = s.zfill(2)
                     return f"{sheet_context['year']}-{sheet_context['month']}-{day}"
@@ -154,8 +154,10 @@ class JSWEnergyPreprocessor:
                 return str(int(num_val)) # Return as cleaned day number
             return None # Reject other numbers (103, 246885, etc.)
         except ValueError:
-            # Not a number (e.g., "SL NO"), return as is
-            return s
+            # Not a number (e.g., "SL NO"), REJECT as date
+            # We used to return the string as is, but that caused issues like "Difference.14" 
+            # being treated as a date. 
+            return None
 
     def process_file(self, file_path_or_obj) -> List[Document]:
         """Process JSW Energy Excel with optimized single-pass reading"""
@@ -245,9 +247,16 @@ class JSWEnergyPreprocessor:
                             swb_col = col
                             
                     if feeder_col is None:
-                        feeder_col = df.columns[0]
-                    if swb_col is None:
-                        swb_col = df.columns[1] if len(df.columns) > 1 else None
+                        # Only take first col if it's not a date
+                        first_col = df.columns[0]
+                        if not self.attempt_date_parse(first_col, sheet_context):
+                            feeder_col = first_col
+                            
+                    if swb_col is None and len(df.columns) > 1:
+                        # Only take second col if it's not a date
+                        second_col = df.columns[1]
+                        if not self.attempt_date_parse(second_col, sheet_context):
+                            swb_col = second_col
                     
                     # Efficiently find date columns and differentiate between Reading and Consumption
                     reading_cols = []
@@ -269,39 +278,105 @@ class JSWEnergyPreprocessor:
                             consumption_cols.append((i, col))
                         elif parsed_date:
                             reading_cols.append((i, col, parsed_date))
-                        else:
-                            # If it's not consumption and not a valid date, skip it (e.g., technical meta-data)
-                            continue
+                        # else:
+                        #    print(f"      DEBUG: Column '{col}' NOT a date (parsed={parsed_date})")
                     
                     if not consumption_cols and not reading_cols:
                         print(f"Warning: No data columns found in sheet {sheet_name}. Columns: {list(df.columns)}")
-                    else:
-                        print(f"  🔍 Sheet '{sheet_name}': Identified {len(reading_cols)} Readings and {len(consumption_cols)} Consumption (Diff) columns.")
+                        continue
 
-                    # Determine primary source for aggregation
-                    data_source_is_consumption = len(consumption_cols) > 0
-                    data_cols = consumption_cols if data_source_is_consumption else reading_cols
+                    print(f"  🔍 Sheet '{sheet_name}': Identified {len(reading_cols)} Readings and {len(consumption_cols)} Consumption (Diff) columns.")
+
+                    # --- ROW CLASSIFICATION LOGIC ---
+                    sheet_daily_feeder_sums = {} # date -> sum
+                    sheet_daily_incomer_sums = {} # date -> sum
+                    sheet_daily_total_rows = {} # date -> val
                     
                     for idx, row in df.iterrows():
-                        feeder = str(row[feeder_col]).strip() if pd.notna(row[feeder_col]) else ""
+                        feeder_raw = str(row[feeder_col]).strip() if pd.notna(row[feeder_col]) else ""
                         swb = str(row[swb_col]).strip() if swb_col and pd.notna(row[swb_col]) else sheet_name
                         
-                        if not feeder or any(x in feeder.upper() for x in ['SWITCH BOARD', 'TOTAL', 'SL NO', 'FEEDER', 'REMARK']):
+                        if not feeder_raw or any(x in feeder_raw.upper() for x in ['SL NO', 'REMARK']):
                             continue
+                        
+                        feeder_upper = feeder_raw.upper()
+                        # KEYWORD SCAN: Identify if this row is a summary or main source
+                        row_type = 'feeder' # Default
+                        
+                        # Broaden keywords for generic industrial use
+                        total_keywords = ['TOTAL', 'GRAND TOTAL', 'NET CONSUMPTION', 'PLANT TOTAL', 'TOTAL PLANT']
+                        source_keywords = ['I/C', 'INCOMER', 'MAIN', 'BUS COUPLER', 'SOURCE', 'FEED', 'INPUT']
+                        
+                        if any(x in feeder_upper for x in total_keywords):
+                            row_type = 'total'
+                        elif any(x in feeder_upper for x in source_keywords):
+                            # Only categorize as incomer/source if it doesn't also look like a total
+                            row_type = 'incomer'
+                        # Decide whether to skip the row
+                        # Generally skip technical/summary rows, BUT allow 'total' and 'incomer' rows
+                        should_process = True
+                        if any(x in feeder_upper for x in ['SWITCH BOARD', 'TOTAL']):
+                            if row_type == 'feeder': # It's just a random "Total" row we don't recognize
+                                should_process = False
+                        
+                        # Allow "FEEDER 1", "FEEDER 2" etc, but skip if it's JUST the word "FEEDER" or "FEEDERS"
+                        if feeder_upper in ['FEEDER', 'FEEDERS', 'SL NO', 'REMARK']:
+                            should_process = False
+
+                        if not should_process:
+                             continue
                         
                         # Avoid 'Unknown' if possible
                         if swb.upper() == 'UNKNOWN' or not swb:
                             swb = sheet_name
                         
-                        feeder_key = f"{feeder} ({swb})"
+                        feeder_key = f"{feeder_raw} ({swb})"
                         if feeder_key not in all_feeders:
-                            all_feeders[feeder_key] = {'name': feeder, 'swb': swb, 'readings': {}, 'last_diff': 0}
+                            all_feeders[feeder_key] = {
+                                'name': feeder_raw, 
+                                'swb': swb, 
+                                'readings': {}, 
+                                'last_diff': 0,
+                                "is_main_source": row_type == 'incomer', # Generic hierarchy flag
+                                "is_total_row": row_type == 'total',
+                                "row_type": row_type,
+                                "context_tags": [feeder_raw] + ([swb] if swb else []), # Basic tags for CSV/Excel
+                                "created_at": datetime.now().strftime("%Y-%m-%d"), # Fallback to today but format correctly
+                                "trusted": True,
+                                "doc_type": "industrial_data",
+                            }
+                        
                         # Combine consumption_cols into items if processing as consumption
                         if consumption_cols:
                             items_to_process = []
-                            for idx, col_name in consumption_cols:
-                                d_str = self.attempt_date_parse(col_name, sheet_context) or str(col_name)
-                                items_to_process.append((idx, col_name, d_str))
+                            # Logic: If consumption_cols matches reading_cols count, map them 1-to-1
+                            if len(consumption_cols) == len(reading_cols):
+                                for i in range(len(consumption_cols)):
+                                    c_idx, col_name = consumption_cols[i]
+                                    r_idx, r_name, r_date = reading_cols[i]
+                                    items_to_process.append((c_idx, col_name, r_date))
+                            else:
+                                # Fallback to spatial proximity
+                                for c_idx, col_name in consumption_cols:
+                                    # Try parsing the header itself first (e.g., "01-07-2024 Diff")
+                                    d_str = self.attempt_date_parse(col_name, sheet_context)
+                                    
+                                    # If not found, look for the nearest previous reading date (Standard JSW interleaved format)
+                                    if not d_str:
+                                        for r_idx, r_name, r_date in reversed(reading_cols):
+                                            if r_idx < c_idx:
+                                                d_str = r_date
+                                                break
+                                                
+                                    # Fallback: nearest subsequent (rare)
+                                    if not d_str:
+                                        for r_idx, r_name, r_date in reading_cols:
+                                            if r_idx > c_idx:
+                                                d_str = r_date
+                                                break
+                                    
+                                    if d_str:
+                                        items_to_process.append((c_idx, col_name, d_str))
                         else:
                             items_to_process = reading_cols
 
@@ -311,35 +386,87 @@ class JSWEnergyPreprocessor:
 
                         for item in items_to_process:
                             col_idx, raw_date_header, date_str = item
-                            raw_val = row.iloc[col_idx]
-                            if pd.isna(raw_val): continue
                             
-                            try:
-                                val = float(raw_val)
-                                # Safe range check for energy readings vs consumption
-                                if val < 0 or val > 100000000: continue
-                            except: continue
-                            
-                            if consumption_cols:
-                                # Direct consumption value (Diff/Cons column found)
-                                feeder_readings[date_str] = val
-                                daily_totals[date_str] = daily_totals.get(date_str, 0) + val
-                                monthly_totals[sheet_name] = monthly_totals.get(sheet_name, 0) + val
-                            else:
-                                # METER READING FALLBACK: Calculate delta from previous reading
-                                if last_reading_val is not None:
-                                    delta = val - last_reading_val
-                                    if 0 <= delta < 1000000: # Safe range for daily consumption
-                                        feeder_readings[date_str] = delta
-                                        daily_totals[date_str] = daily_totals.get(date_str, 0) + delta
-                                        monthly_totals[sheet_name] = monthly_totals.get(sheet_name, 0) + delta
-                                last_reading_val = val
+                            # If date_str is not a valid date or numeric day, try to find the nearest previous reading date
+                            if not date_str or (not re.match(r'^\d{4}-\d{2}-\d{2}$', str(date_str)) and not (str(date_str).isdigit() and 1 <= int(date_str) <= 31)):
+                                # This handles "Difference.14" etc. 
+                                # We look for the date in reading_cols that matches the index pattern if possible,
+                                # but for now, we simply skip columns that aren't clearly dates to avoid bad data.
+                                continue
 
-                        # Accumulate readings across sheets (months)
-                        all_feeders[feeder_key]['readings'].update(feeder_readings)
+                            raw_val = row.iloc[col_idx]
+                            
+                            # Update last_reading_val even if raw_val is NaN to maintain delta chain
+                            current_val = None
+                            try:
+                                if pd.notna(raw_val):
+                                    current_val = float(raw_val)
+                                    if current_val < 0 or current_val > 100000000:
+                                        current_val = None
+                            except: pass
+                            
+                            consumption_val = 0
+                            if consumption_cols:
+                                if current_val is not None:
+                                    consumption_val = current_val
+                            else:
+                                if current_val is not None and last_reading_val is not None:
+                                    delta = current_val - last_reading_val
+                                    if 0 <= delta < 1000000:
+                                        consumption_val = delta
+                                # Always update last_reading_val if we have a current_val
+                                if current_val is not None:
+                                    last_reading_val = current_val
+                            
+                            if consumption_val > 0:
+                                feeder_readings[date_str] = consumption_val
+                                
+                                # Accurate Aggregation logic (Once per reading!):
+                                if row_type == 'total':
+                                    sheet_daily_total_rows[date_str] = max(sheet_daily_total_rows.get(date_str, 0), consumption_val)
+                                elif row_type == 'incomer':
+                                    sheet_daily_incomer_sums[date_str] = sheet_daily_incomer_sums.get(date_str, 0) + consumption_val
+                                else:
+                                    sheet_daily_feeder_sums[date_str] = sheet_daily_feeder_sums.get(date_str, 0) + consumption_val
+
+                        # Accumulate readings for the feeder document
+                        if row_type != 'total': # Don't create feeder docs for "Total" rows
+                            all_feeders[feeder_key]['readings'].update(feeder_readings)
                 
+                    # --- HIERARCHICAL PLANT TOTAL AGGREGATION ---
+                    # For this sheet, we now decide what the real "Daily Total" is
+                    all_dates = set(list(sheet_daily_total_rows.keys()) + list(sheet_daily_incomer_sums.keys()) + list(sheet_daily_feeder_sums.keys()))
+                    
+                    sheet_total_cons = 0
+                    if not all_dates:
+                        print(f"    ⚠️ No data extracted from sheet {sheet_name}")
+                    
+                    for d_str in sorted(all_dates):
+                        # Priority: 1. Total Row, 2. Incomer Sum, 3. Feeder Sum
+                        final_daily_val = 0
+                        method = ""
+                        
+                        # ONLY use total_row if it actually HAS a value for this date
+                        if d_str in sheet_daily_total_rows and sheet_daily_total_rows[d_str] > 0:
+                            final_daily_val = sheet_daily_total_rows[d_str]
+                            method = "total_row"
+                        elif d_str in sheet_daily_incomer_sums and sheet_daily_incomer_sums[d_str] > 0:
+                            final_daily_val = sheet_daily_incomer_sums[d_str]
+                            method = "incomer_sum"
+                        else:
+                            final_daily_val = sheet_daily_feeder_sums.get(d_str, 0)
+                            method = "feeder_sum"
+                        
+                        if final_daily_val > 0:
+                            daily_totals[d_str] = daily_totals.get(d_str, 0) + final_daily_val
+                            sheet_total_cons += final_daily_val
+                        
+                    monthly_totals[sheet_name] = sheet_total_cons
+
                 except Exception as e:
+                    import traceback
                     print(f"\nWarning: Error in sheet {sheet_name}: {e}")
+                    # traceback.print_exc()
             
         except Exception as e:
             import traceback
@@ -351,21 +478,48 @@ class JSWEnergyPreprocessor:
         feeder_docs_count = 0
         for feeder_key, data in all_feeders.items():
             if not data['readings']: continue
+            if data.get('is_total_row'): continue # Skip total rows in individual feeder docs
             
             readings = list(data['readings'].values())
             avg = np.mean(readings)
             total = np.sum(readings)
             
+            # IMPORTANT: For industrial_data rows, we should tag them with the specific date of the reading
+            # to enable temporal filtering in RAG.
+            first_date = min(data['readings'].keys()) if data['readings'] else datetime.now().strftime("%Y-%m-%d")
+            last_date = max(data['readings'].keys()) if data['readings'] else datetime.now().strftime("%Y-%m-%d")
+            
+            # Update created_at to the most representative date (e.g., start of the month/period)
+            data_metadata = data.copy()
+            data_metadata['created_at'] = first_date 
+            data_metadata['data_date_start'] = first_date
+            data_metadata['data_date_end'] = last_date
+            
+            prefix = "[INCOMER] " if data.get('is_incomer') else ""
             content = (
-                f"Feeder: {feeder_key} | Location: {data['swb']} | "
+                f"{prefix}Feeder: {feeder_key} | Location: {data['swb']} | "
                 f"Avg daily: {avg:.1f} KWH | Total: {total:.1f} KWH | "
-                f"Period: {min(data['readings'].keys())} to {max(data['readings'].keys())}"
+                f"Period: {first_date} to {last_date}"
             )
+            
+            documents.append(Document(
+                doc_id=f"row_{uuid.uuid4().hex[:8]}",
+                file_id=file_id,
+                file_name=file_name,
+                doc_type="industrial_data",
+                content=content,
+                metadata=data_metadata
+            ))
             
             documents.append(Document(
                 doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name,
                 doc_type="feeder_data", content=content,
-                metadata={"feeder": data['name'], "location": data['swb'], "total": float(total)}
+                metadata={
+                    "feeder": data['name'], 
+                    "location": data['swb'], 
+                    "total": float(total),
+                    "is_incomer": data.get('is_incomer', False)
+                }
             ))
             feeder_docs_count += 1
         

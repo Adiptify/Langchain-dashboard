@@ -26,6 +26,8 @@ from llm_reasoning import LLMReasoning
 from suggestion_engine import suggestion_engine
 from user_profiles import user_profile_manager
 from utils import logger, log_process_completion
+from date_utils import date_extractor
+from query_rewriter import query_analyzer
 
 logger.info("==================================================")
 logger.info("   MENDYGO AI BRIDGE - INITIALIZING SYSTEM       ")
@@ -100,7 +102,21 @@ def chat(request: ChatRequest):
     try:
         # Search for relevant data
         logger.info("Searching embedding store for relevant context...")
-        results = embedding_store.search(request.prompt, k=5)
+        
+        # New: Analyze query for technical entities and intent
+        analysis = query_analyzer.analyze_query(request.prompt)
+        primary_entities = analysis.get("primary_entities", [])
+        search_query = analysis.get("intent", request.prompt)
+        
+        if primary_entities:
+            logger.info(f"Detected primary technical entities: {primary_entities}")
+        
+        # New: Extract date range from prompt
+        date_filter = date_extractor.extract_date_range(request.prompt)
+        if date_filter:
+            logger.info(f"Detected date filter: {date_filter}")
+            
+        results = embedding_store.search(search_query, k=5, date_filter=date_filter, primary_entities=primary_entities)
         logger.info(f"Retrieved {len(results)} context documents.")
         
         # Inject global context (Summaries and Monthly Totals)
@@ -139,7 +155,8 @@ def chat(request: ChatRequest):
         llm_result = llm.perform_reasoning(request.prompt, llm_context, chat_history=request.chat_history)
         return {
             "answer": llm_result.get("answer", "Unable to generate response"),
-            "results": results
+            "results": results,
+            "detected_date_range": date_filter
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
