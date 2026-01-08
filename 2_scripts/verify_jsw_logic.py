@@ -112,11 +112,30 @@ if __name__ == "__main__":
     docs = preprocessor.process_file(temp_excel)
     
     print("\nDocument Inspection:")
+    doc_types = {}
     for doc in docs:
+        dtype = doc.doc_type
+        doc_types[dtype] = doc_types.get(dtype, 0) + 1
+        
+        # Verify metadata
+        if 'created_at' not in doc.metadata:
+            print(f"  🚨 MISSING created_at: {doc.doc_id} ({dtype})")
+            
         if doc.doc_type == "plant_summary":
             print(f"  Summary Doc: {doc.content}")
-        elif "TOTAL" in doc.content.upper():
+        elif "TOTAL" in doc.content.upper() and doc.doc_type == "daily_total":
              print(f"  Total Info: {doc.content}")
+    
+    print("\nDocument Statistics:")
+    for dtype, count in doc_types.items():
+        print(f"  - {dtype}: {count}")
+    
+    # Logic Checks
+    print("\nLogic Verification:")
+    if doc_types.get('industrial_data', 0) == 3: # 3 feeders
+        print("  ✅ Duplication: Resolved (Exactly 3 feeder docs created)")
+    else:
+        print(f"  ❌ Duplication: {doc_types.get('industrial_data', 0)} docs found (!= 3)")
             
     # Clean up
     try:

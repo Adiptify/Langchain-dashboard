@@ -13,6 +13,7 @@ import sys
 import os
 import re
 from tqdm import tqdm
+from datetime import datetime, date
 
 # Add parent dir to path to find ingestion_pipeline
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -158,6 +159,40 @@ class JSWEnergyPreprocessor:
             # We used to return the string as is, but that caused issues like "Difference.14" 
             # being treated as a date. 
             return None
+    def get_human_date(self, date_str: str) -> str:
+        """Convert YYYY-MM-DD to human readable string"""
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            return dt.strftime("%B %d, %Y")
+        except:
+            return date_str
+
+    def get_human_month(self, month_str: str) -> str:
+        """Convert JAN-24 to January 2024"""
+        try:
+            if '-' in month_str:
+                parts = month_str.split('-')
+                m_abbr = parts[0].upper()
+                y_suffix = parts[1]
+                if m_abbr == 'SEPT': m_abbr = 'SEP'
+                dt = datetime.strptime(f"{m_abbr}-{y_suffix}", "%b-%y")
+                return dt.strftime("%B %Y")
+        except: pass
+        return month_str
+
+    def standardize_month_to_iso(self, month_str: str) -> str:
+        """Convert JAN-24 to 2024-01-01"""
+        try:
+            if '-' in month_str:
+                parts = month_str.split('-')
+                m_abbr = parts[0].upper()
+                y_suffix = parts[1]
+                if m_abbr == 'SEPT': m_abbr = 'SEP'
+                dt = datetime.strptime(f"{m_abbr}-{y_suffix}", "%b-%y")
+                return dt.strftime("%Y-%m-01")
+        except: pass
+        return datetime.now().strftime("%Y-%m-01")
+
 
     def process_file(self, file_path_or_obj) -> List[Document]:
         """Process JSW Energy Excel with optimized single-pass reading"""
@@ -478,48 +513,42 @@ class JSWEnergyPreprocessor:
         feeder_docs_count = 0
         for feeder_key, data in all_feeders.items():
             if not data['readings']: continue
-            if data.get('is_total_row'): continue # Skip total rows in individual feeder docs
+            if data.get('is_total_row'): continue 
             
             readings = list(data['readings'].values())
             avg = np.mean(readings)
             total = np.sum(readings)
             
-            # IMPORTANT: For industrial_data rows, we should tag them with the specific date of the reading
-            # to enable temporal filtering in RAG.
-            first_date = min(data['readings'].keys()) if data['readings'] else datetime.now().strftime("%Y-%m-%d")
-            last_date = max(data['readings'].keys()) if data['readings'] else datetime.now().strftime("%Y-%m-%d")
+            # Use the most recent date as the reference for this document
+            ref_date = max(data['readings'].keys()) if data['readings'] else datetime.now().strftime("%Y-%m-%d")
             
-            # Update created_at to the most representative date (e.g., start of the month/period)
-            data_metadata = data.copy()
-            data_metadata['created_at'] = first_date 
-            data_metadata['data_date_start'] = first_date
-            data_metadata['data_date_end'] = last_date
+            # Standardize metadata for RAG filtering
+            data_metadata = {
+                "feeder": data['name'],
+                "location": data['swb'],
+                "total": float(total),
+                "avg": float(avg),
+                "is_incomer": data.get('is_incomer', False),
+                "created_at": ref_date, # ISO format for filtering
+                "data_date": ref_date,
+                "data_date_start": min(data['readings'].keys()),
+                "data_date_end": ref_date
+            }
             
             prefix = "[INCOMER] " if data.get('is_incomer') else ""
             content = (
                 f"{prefix}Feeder: {feeder_key} | Location: {data['swb']} | "
                 f"Avg daily: {avg:.1f} KWH | Total: {total:.1f} KWH | "
-                f"Period: {first_date} to {last_date}"
+                f"Period: {data_metadata['data_date_start']} to {data_metadata['data_date_end']}"
             )
             
             documents.append(Document(
-                doc_id=f"row_{uuid.uuid4().hex[:8]}",
+                doc_id=f"feeder_{uuid.uuid4().hex[:8]}",
                 file_id=file_id,
                 file_name=file_name,
                 doc_type="industrial_data",
                 content=content,
                 metadata=data_metadata
-            ))
-            
-            documents.append(Document(
-                doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name,
-                doc_type="feeder_data", content=content,
-                metadata={
-                    "feeder": data['name'], 
-                    "location": data['swb'], 
-                    "total": float(total),
-                    "is_incomer": data.get('is_incomer', False)
-                }
             ))
             feeder_docs_count += 1
         
@@ -527,18 +556,43 @@ class JSWEnergyPreprocessor:
         
         print(f"📅 Creating {len(daily_totals)} daily summaries...")
         for date, total in sorted(daily_totals.items()):
+            # Enhance content for keyword search
+            hr_date = self.get_human_date(date)
+            content = f"DAILY TOTAL Energy Consumption for {hr_date} ({date}): {total:,.1f} KWH"
+            
             documents.append(Document(
-                doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name,
-                doc_type="daily_total", content=f"Date: {date} | Total Plant Cons: {total:,.1f} KWH",
-                metadata={"date": date, "total": float(total), "aliases": self.get_date_aliases(date)}
+                doc_id=f"daily_{uuid.uuid4().hex[:8]}",
+                file_id=file_id,
+                file_name=file_name,
+                doc_type="daily_total",
+                content=content,
+                metadata={
+                    "date": date, 
+                    "created_at": date, # CRITICAL for filtering
+                    "total": float(total),
+                    "is_total": True
+                }
             ))
             
         print(f"🗓️ Creating {len(monthly_totals)} monthly summaries...")
         for month, total in monthly_totals.items():
+            # month is likely "JAN-24"
+            iso_month = self.standardize_month_to_iso(month)
+            hr_month = self.get_human_month(month)
+            content = f"MONTHLY TOTAL Energy Consumption for {hr_month} ({month}): {total:,.1f} KWH"
+            
             documents.append(Document(
-                doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name,
-                doc_type="monthly_total", content=f"Month: {month} | Total Plant Cons: {total:,.1f} KWH",
-                metadata={"month": month, "total": float(total), "aliases": self.get_date_aliases(month, is_month=True)}
+                doc_id=f"month_{uuid.uuid4().hex[:8]}",
+                file_id=file_id,
+                file_name=file_name,
+                doc_type="monthly_total",
+                content=content,
+                metadata={
+                    "month": month,
+                    "created_at": iso_month, # Use 1st of month for filtering
+                    "total": float(total),
+                    "is_total": True
+                }
             ))
             
         # Global Summary
@@ -560,7 +614,9 @@ class JSWEnergyPreprocessor:
             )
             
             documents.append(Document(
-                doc_id=str(uuid.uuid4()), file_id=file_id, file_name=file_name,
+                doc_id=f"summary_{uuid.uuid4().hex[:8]}",
+                file_id=file_id,
+                file_name=file_name,
                 doc_type="plant_summary",
                 content=summary_content,
                 metadata={
@@ -568,7 +624,8 @@ class JSWEnergyPreprocessor:
                     "months": list(monthly_totals.keys()),
                     "peak_day": peak_day[0],
                     "peak_day_val": float(peak_day[1]),
-                    "peak_month": peak_month[0]
+                    "peak_month": peak_month[0],
+                    "created_at": peak_day[0] # Reference date
                 }
             ))
         else:

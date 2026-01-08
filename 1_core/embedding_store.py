@@ -379,7 +379,7 @@ class EmbeddingStore:
                         "doc_type": row[3],
                         "content": row[4],
                         "metadata": metadata,
-                        "score": score,
+                        "score": score + (1.5 if row[3] in ['daily_total', 'monthly_total'] else 0), # Boost summary docs
                         "match_type": "keyword"
                     })
                     seen_ids.add(row[0])
@@ -435,7 +435,7 @@ class EmbeddingStore:
                             "content": content,
                             "metadata": json.loads(metadata_str),
                             "distance": distance,
-                            "score": similarity_score,
+                            "score": similarity_score + (1.0 if doc_type in ['daily_total', 'monthly_total'] else 0), # Boost summaries 
                             "match_type": "vector"
                         })
             if len(results) >= k:
